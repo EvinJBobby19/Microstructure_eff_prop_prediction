@@ -29,14 +29,14 @@ from netCDF4 import Dataset
 
 # CONFIG
 DENSITY_VAR   = "density"
-KAPPA_ATTR    = "kappa_eff"   # achieved kappa attr; switch to "kappa_thresh" for binarized
+KAPPA_ATTR    = "kappa_eff"   # achieved kappa attr; switch to "kappa_thresh" for binarized kappa_eff for otherwise
 
-USE_SCALAR    = False          # False -> per-component Standardizer, True -> ScalarNormalizer
+USE_SCALAR    = True          # False -> per-component Standardizer, True -> ScalarNormalizer
 KAPPA_SOLID   = 1.0           # solid-phase conductivity (--kappa-solid in simulate_conduction.py)
 
 DROP_NONCONVERGED = True
 
-DEFAULT_GLOB  = "//wsl.localhost/Ubuntu/home/evin/muTopOpt/test_dataset_5000/**/result2D_*.nc"
+DEFAULT_GLOB  = "//wsl.localhost/Ubuntu/home/evin/muTopOpt/test_dataset_1000/**/result2D_*.nc"  
 
 VAL_FRAC      = 0.15
 TEST_FRAC     = 0.15
@@ -164,7 +164,9 @@ def load_dataset(data_glob):
                 skipped_conv += 1; ds.close(); continue
             if KAPPA_ATTR not in ds.ncattrs():  #kappa_eff this is the kappa atribute that we are searching for in the .nc file
                 skipped_read += 1; ds.close(); continue
-            rho = _read_density(ds)                   
+            rho = _read_density(ds)  
+            if KAPPA_ATTR == "kappa_thresh":  # binarized kappa, so binarize the density too
+                rho = (rho >= 0.5).astype(np.float32)                 
             y = _kappa3(getattr(ds, KAPPA_ATTR))
             t = _target3_from_cmd(ds)                 
             ds.close()
@@ -302,12 +304,13 @@ def train(X, Y, tr, va, run_dir):
     model = MicrostructureCNN().to(DEVICE)
 
     if USE_SCALAR:
-        std = ScalarNormalizer(Y[tr], scale=KAPPA_SOLID)
+        std = ScalarNormalizer(Y[tr], scale=None)
     else:
         std = Standardizer(Y[tr])
     std.mean = std.mean.to(DEVICE); std.std = std.std.to(DEVICE)
 
     opt = torch.optim.Adam(model.parameters(), lr=LR)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=MAX_EPOCHS)   # <<< ADDED ***************************
     loss_fn = nn.MSELoss()
 
     history = {"epoch": [], "train_loss": [], "val_loss": []}      # <<< ADDED
@@ -319,14 +322,19 @@ def train(X, Y, tr, va, run_dir):
         for xb, yb in batches(X, Y, tr, BATCH_SIZE, shuffle=True):  # shuffle is set to false because we want to keep the order of the data consistent across epochs
             opt.zero_grad()
             loss = loss_fn(model(xb), std.encode(yb))
+            # loss = loss_fn(std.decode(model(xb)), yb)   #***********************remove ***************************
             loss.backward(); opt.step()
             tloss += loss.item(); tnb += 1                         # <<< ADDED
         tloss /= max(tnb, 1)
+        sched.step()  # <<< ADDED **********************
 
         model.eval(); vloss, nb = 0.0, 0
         with torch.no_grad():
-            for xb, yb in batches(X, Y, va, BATCH_SIZE, shuffle=True):
-                vloss += loss_fn(model(xb), std.encode(yb)).item(); nb += 1
+            for xb, yb in batches(X, Y, va, BATCH_SIZE, shuffle=False):
+                # vloss += loss_fn(model(xb), std.encode(yb)).item(); nb += 1
+                vloss += loss_fn(model(xb), std.encode(yb)).item() * len(xb)   # <<< CHANGED
+                # vloss += loss_fn(std.decode(model(xb)), yb).item() * len(xb) #************************remove *****************************
+                nb += len(xb)                                                  # <<< CHANGED
         vloss /= max(nb, 1)
 
         history["epoch"].append(epoch)                            # <<< ADDED
