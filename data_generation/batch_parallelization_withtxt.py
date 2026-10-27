@@ -82,6 +82,7 @@ DEFAULT_GRID = 64               # square grid; -> GRID_SIZE = [GRID, GRID]
 
 DEFAULT_BFGS_MAXITER = 500       # 200 was too low near KAPPA_MAX; 500 fixed it
 DEFAULT_BFGS_GTOL = 2.5        # simulate_conduction.py default is 2.5
+DEFAULT_REG_WEIGHT = None      # <<< ADDED  None -> --reg-weight not passed, simulate_conduction.py uses its own default
 
 SIMULATION_SCRIPT = "simulate_conduction.py"
 
@@ -151,6 +152,8 @@ def run_single_simulation(cfg, output_file, kappa_xx, kappa_yy):
         #                "--ntasks",str(cfg.mpi_processes)] + sim_command
     if cfg.use_gtol:
         sim_command += ["--bfgs-gtol", str(cfg.bfgs_gtol)]
+    if cfg.reg_weight is not None:                                   # <<< ADDED
+        sim_command += ["--reg-weight", str(cfg.reg_weight)]         # <<< ADDED
 
     # Wrap with /usr/bin/time -v to get a per-subprocess peak RSS that's safe
     # to read under thread concurrency.
@@ -201,7 +204,8 @@ def generate_batch(cfg, batch_id):
 def _generate_batch_body(cfg, batch_id, seed, batch_dir):
     print("\n" + "#" * 60)
     print(f"Batch {batch_id} | seed={seed} | {cfg.num_samples} samples "
-          f"| {cfg.max_concurrent_sims} concurrent sims x {cfg.mpi_processes} ranks each")
+          f"| {cfg.max_concurrent_sims} concurrent sims x {cfg.mpi_processes} ranks each "
+          f"| reg_weight={cfg.reg_weight if cfg.reg_weight is not None else 'sim default'}")   # <<< CHANGED
     print("#" * 60)
 
     # Pre-generate all kappa targets up front, single-threaded, so the RNG
@@ -272,6 +276,7 @@ def _generate_batch_body(cfg, batch_id, seed, batch_dir):
                 "kappa_min": KAPPA_MIN,
                 "kappa_max": KAPPA_MAX,
                 "bfgs_maxiter": cfg.bfgs_maxiter,
+                "reg_weight": cfg.reg_weight,                        # <<< ADDED  null in json if not passed
                 "use_mpi": cfg.use_mpi,
                 "mpi_processes": cfg.mpi_processes,
                 "max_concurrent_sims": cfg.max_concurrent_sims,
@@ -316,6 +321,9 @@ def parse_args():
                    help="L-BFGS max iterations.")
     p.add_argument("--bfgs-gtol", type=float, default=DEFAULT_BFGS_GTOL,
                    help="L-BFGS gradient tolerance.")
+    p.add_argument("--reg-weight", type=float, default=DEFAULT_REG_WEIGHT,               # <<< ADDED
+                   help="Phase-field regularization weight passed to simulate_conduction.py. "  # <<< ADDED
+                        "If omitted, the flag is not passed and the simulation's own default is used.")  # <<< ADDED
     p.add_argument("--no-mpi", action="store_true",
                    help="Disable mpirun; run simulate_conduction.py directly.")
     p.add_argument("--no-gtol", action="store_true",
@@ -330,6 +338,9 @@ def parse_args():
     args.grid_size = [args.grid, args.grid]
     args.use_mpi = not args.no_mpi
     args.use_gtol = not args.no_gtol
+
+    if args.reg_weight is not None and args.reg_weight < 0:                              # <<< ADDED
+        raise SystemExit(f"--reg-weight must be >= 0, got {args.reg_weight}.")           # <<< ADDED
 
     if args.output_dir is None:
         # e.g. batch_parallelization/res_128/g128_mpi20_c1
@@ -364,7 +375,8 @@ def main():
 
     print(f"Starting dataset generation at {time.ctime()}")
     print(f"grid={cfg.grid_size} mpi={cfg.mpi_processes} "
-          f"concurrent={cfg.max_concurrent_sims} out={cfg.output_dir}")
+          f"concurrent={cfg.max_concurrent_sims} reg_weight={cfg.reg_weight} "   # <<< CHANGED
+          f"out={cfg.output_dir}")
     overall_start = time.perf_counter()
 
     for batch_id in range(cfg.num_batches):

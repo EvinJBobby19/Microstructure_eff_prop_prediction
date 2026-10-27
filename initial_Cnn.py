@@ -29,14 +29,17 @@ from netCDF4 import Dataset
 
 # CONFIG
 DENSITY_VAR   = "density"
-KAPPA_ATTR    = "kappa_eff"   # achieved kappa attr; switch to "kappa_thresh" for binarized kappa_eff for otherwise
+KAPPA_ATTR    = "kappa_thresh"   # achieved kappa attr; switch to "kappa_thresh" for binarized kappa_eff for otherwise
 
 USE_SCALAR    = True          # False -> per-component Standardizer, True -> ScalarNormalizer
 KAPPA_SOLID   = 1.0           # solid-phase conductivity (--kappa-solid in simulate_conduction.py)
 
 DROP_NONCONVERGED = True
 
-DEFAULT_GLOB  = "//wsl.localhost/Ubuntu/home/evin/muTopOpt/test_dataset_1000/**/result2D_*.nc"  
+DROP_ZERO_KAPPA = True        # <<< ADDED  drop samples whose thresholded kxx or kyy is ~0 (only applied when KAPPA_ATTR == "kappa_thresh")
+ZERO_TOL        = 1e-6        # <<< ADDED  |k| <= ZERO_TOL counts as zero; set just above your void-phase conductivity if it is nonzero
+
+DEFAULT_GLOB  = "//wsl.localhost/Ubuntu/home/evin/muTopOpt/test_dataset_rw1000/**/result2D_*.nc"  
 
 VAL_FRAC      = 0.15
 TEST_FRAC     = 0.15
@@ -125,6 +128,11 @@ def _kappa3(flat):
     return np.array([kxx, 0.5 * (kxy + kyx), kyy], dtype=np.float32)   # off diagonal is symmetrized , is usually zero or near to zero 
 
 
+def _has_zero_diag(y):                                                  # <<< ADDED
+    """True if kxx or kyy of the symmetric 3-vector is ~0."""           # <<< ADDED
+    return abs(y[0]) <= ZERO_TOL or abs(y[2]) <= ZERO_TOL               # <<< ADDED
+
+
 _TARGET_RE = re.compile(                              
     r"--target-kappa\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)")
 
@@ -155,6 +163,8 @@ def load_dataset(data_glob):
         raise SystemExit(f"No files matched: {data_glob}")
     xs, ys, ts = [], [], []
     skipped_read = skipped_conv = 0                   
+    skipped_zero = 0                                                    # <<< ADDED
+    filter_zero = DROP_ZERO_KAPPA and KAPPA_ATTR == "kappa_thresh"      # <<< ADDED
 
     for f in files:
         try:
@@ -164,10 +174,12 @@ def load_dataset(data_glob):
                 skipped_conv += 1; ds.close(); continue
             if KAPPA_ATTR not in ds.ncattrs():  #kappa_eff this is the kappa atribute that we are searching for in the .nc file
                 skipped_read += 1; ds.close(); continue
+            y = _kappa3(getattr(ds, KAPPA_ATTR))                        # <<< CHANGED (moved up so we can skip before reading density)
+            if filter_zero and _has_zero_diag(y):                       # <<< ADDED
+                skipped_zero += 1; ds.close(); continue                 # <<< ADDED
             rho = _read_density(ds)  
             if KAPPA_ATTR == "kappa_thresh":  # binarized kappa, so binarize the density too
                 rho = (rho >= 0.5).astype(np.float32)                 
-            y = _kappa3(getattr(ds, KAPPA_ATTR))
             t = _target3_from_cmd(ds)                 
             ds.close()
         except Exception as e:
@@ -184,7 +196,8 @@ def load_dataset(data_glob):
     Y = np.stack(ys).astype(np.float32)
     T = np.stack(ts).astype(np.float32)
     print(f"Loaded {len(X)} samples, rho shape {X.shape[1:]}, target attr = {KAPPA_ATTR}")
-    print(f"  dropped: {skipped_conv} non-converged, {skipped_read} unreadable/no-kappa")
+    print(f"  dropped: {skipped_conv} non-converged, {skipped_read} unreadable/no-kappa, "   # <<< CHANGED
+          f"{skipped_zero} zero kxx/kyy (filter {'on' if filter_zero else 'off'}, tol={ZERO_TOL:g})")  # <<< ADDED
     info = {
         "data_glob": data_glob,
         "data_glob_abspath": os.path.abspath(data_glob),
@@ -192,6 +205,7 @@ def load_dataset(data_glob):
         "n_samples_used": len(X),
         "n_dropped_nonconverged": skipped_conv,
         "n_dropped_unreadable": skipped_read,
+        "n_dropped_zero_kappa": skipped_zero,                           # <<< ADDED
         "density_shape": list(X.shape[1:]),
     }
     return X, Y, T, info
@@ -433,6 +447,8 @@ def config_dict():
         "normalizer": "ScalarNormalizer" if USE_SCALAR else "Standardizer",
         "KAPPA_SOLID": KAPPA_SOLID if USE_SCALAR else None,
         "DROP_NONCONVERGED": DROP_NONCONVERGED,
+        "DROP_ZERO_KAPPA": DROP_ZERO_KAPPA and KAPPA_ATTR == "kappa_thresh",   # <<< ADDED (records whether the filter was actually active)
+        "ZERO_TOL": ZERO_TOL,                                                  # <<< ADDED
         "VAL_FRAC": VAL_FRAC, "TEST_FRAC": TEST_FRAC,
         "BATCH_SIZE": BATCH_SIZE, "LR": LR, "optimizer": "Adam", "loss": "MSELoss",
         "MAX_EPOCHS": MAX_EPOCHS, "PATIENCE": PATIENCE,
