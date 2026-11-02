@@ -7,6 +7,8 @@ so the main file stays uncluttered.
 Usage:
   python plot_curves.py                         # uses the most recent run in runs/
   python plot_curves.py runs/2026-10-12_18-00-00_standard
+  python plot_curves.py --kxy                   # also include kxy in the parity plot   # <<< ADDED
+  python plot_curves.py runs/<run> --kxy                                                 # <<< ADDED
 
 Reads from the run folder:
   history.csv      -> training_curve.png   (train & val loss vs epoch)
@@ -16,11 +18,11 @@ PNGs are saved back into that same run folder.
 Needs matplotlib:  pip install matplotlib
 """
 
+import argparse                                        # <<< ADDED
 import csv
 import glob
 import os
-import sys
-import numpy as np
+import numpy as np                                     # <<< CHANGED (sys no longer needed)
 import matplotlib.pyplot as plt
 
 RUNS_DIR    = "runs"
@@ -72,7 +74,7 @@ def plot_training_curve(run_dir):
 # ---------------------------------------------------------------------------
 # Parity plot: predicted vs true on the test set (the honest "test" plot)
 # ---------------------------------------------------------------------------
-def plot_parity(run_dir):
+def plot_parity(run_dir, include_kxy=False):           # <<< CHANGED
     path = os.path.join(run_dir, "predictions.csv")
     if not os.path.exists(path):
         print("  no predictions.csv found; skipping parity plot")
@@ -87,7 +89,7 @@ def plot_parity(run_dir):
     true = {n: np.array(v) for n, v in true.items()}
     pred = {n: np.array(v) for n, v in pred.items()}
 
-    comps = ["kxx", "kyy"]                             # kxy ~ 0, not meaningful to plot
+    comps = ["kxx", "kxy", "kyy"] if include_kxy else ["kxx", "kyy"]   # <<< CHANGED
     fig, axes = plt.subplots(1, len(comps), figsize=(5 * len(comps), 4.5))
     if len(comps) == 1:
         axes = [axes]
@@ -115,10 +117,17 @@ def plot_parity(run_dir):
 
 
 def main():
-    run_dir = sys.argv[1] if len(sys.argv) > 1 else latest_run()
+    parser = argparse.ArgumentParser(description="Plot training curve and parity plot for a run.")  # <<< ADDED
+    parser.add_argument("run_dir", nargs="?", default=None,                                          # <<< ADDED
+                        help="run folder (default: most recent in runs/)")                          # <<< ADDED
+    parser.add_argument("--kxy", action="store_true",                                                # <<< ADDED
+                        help="include kxy in the parity plot")                                       # <<< ADDED
+    args = parser.parse_args()                                                                       # <<< ADDED
+
+    run_dir = args.run_dir if args.run_dir else latest_run()                                         # <<< CHANGED
     print(f"Run folder: {run_dir}")
     plot_training_curve(run_dir)
-    plot_parity(run_dir)
+    plot_parity(run_dir, include_kxy=args.kxy)                                                       # <<< CHANGED
 
 
 if __name__ == "__main__":

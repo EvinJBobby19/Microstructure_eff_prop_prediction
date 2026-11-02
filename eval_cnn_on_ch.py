@@ -13,7 +13,7 @@ Usage:
 Writes into <run-dir>/ch_eval[_<tag>]/:
     ch_metrics.json        CH metrics + in-distribution metrics from run.json
     ch_predictions.csv     per sample: file, vf, true, pred, abs error
-    ch_parity.png          parity plots kxx / kxy / kyy (CH vs y=x)
+    ch_parity.png          parity plots kxx / kxy / kyy (CH vs y=x), with RMSE / MAE / R2   # <<< CHANGED
     ch_error_vs_vf.png     |error| vs volume fraction
 """
 
@@ -106,13 +106,15 @@ def main():
     m_in = metrics(Y[in_range], P[in_range]) if in_range.sum() > 2 else None
     m_train = train_info.get("test_metrics")
 
-    print(f"\n{'':6s}{'in-dist test (TO)':>24s}{'CH all':>24s}{'CH in-range':>24s}")
-    print(f"{'':6s}{'RMSE / R2':>24s}{'RMSE / R2':>24s}{'RMSE / R2':>24s}")
+    print(f"\n{'':6s}{'in-dist test (TO)':>30s}{'CH all':>30s}{'CH in-range':>30s}")    # <<< CHANGED
+    print(f"{'':6s}{'RMSE / MAE / R2':>30s}{'RMSE / MAE / R2':>30s}{'RMSE / MAE / R2':>30s}")  # <<< CHANGED
     fmt = lambda d: ("-" if d is None else
-                     f"{d['RMSE']:.4f} / " + ("n/a" if d.get('R2') is None else f"{d['R2']:.3f}"))
+                     f"{d['RMSE']:.4f} / "
+                     + ("n/a" if d.get('MAE') is None else f"{d['MAE']:.4f}") + " / "     # <<< ADDED
+                     + ("n/a" if d.get('R2') is None else f"{d['R2']:.3f}"))
     for n in cnn.LABEL_NAMES:
-        print(f"{n:6s}{fmt(m_train.get(n) if m_train else None):>24s}"
-              f"{fmt(m_all[n]):>24s}{fmt(m_in[n] if m_in else None):>24s}")
+        print(f"{n:6s}{fmt(m_train.get(n) if m_train else None):>30s}"                    # <<< CHANGED
+              f"{fmt(m_all[n]):>30s}{fmt(m_in[n] if m_in else None):>30s}")               # <<< CHANGED
     print(f"CH samples: {len(Y)} total, {int(in_range.sum())} inside training kxx/kyy range")
 
     # ---- save ----
@@ -149,17 +151,19 @@ def main():
         lo = min(Y[:, i].min(), P[:, i].min()); hi = max(Y[:, i].max(), P[:, i].max())
         ax.plot([lo, hi], [lo, hi], "k--", lw=1)
         r2 = m_all[n]["R2"]
-        ax.set_title(f"{n}: RMSE={m_all[n]['RMSE']:.4f}"
-                     + ("" if r2 is None else f"  R²={r2:.3f}"))
+        ax.set_title(f"{n}: RMSE={m_all[n]['RMSE']:.4f}  MAE={m_all[n]['MAE']:.4f}"     # <<< CHANGED
+                     + ("" if r2 is None else f"\nR²={r2:.3f}"), fontsize=10)           # <<< CHANGED
         ax.set_xlabel(f"true {n} (muSpectre)"); ax.set_ylabel(f"predicted {n} (CNN)")
     axs[0].legend(fontsize=8)
     fig.tight_layout(); fig.savefig(os.path.join(out_dir, "ch_parity.png"), dpi=150)
 
     fig, ax = plt.subplots(figsize=(6, 4.3))
     for i, n in [(0, "kxx"), (2, "kyy")]:
-        ax.scatter(vf, np.abs(P[:, i] - Y[:, i]), s=10, label=n)
+        ax.scatter(vf, np.abs(P[:, i] - Y[:, i]), s=10,
+                   label=f"{n} (MAE={m_all[n]['MAE']:.4f})")                             # <<< CHANGED
+        ax.axhline(m_all[n]["MAE"], ls="--", lw=1, color=f"C{0 if i == 0 else 1}")       # <<< ADDED
     ax.set_xlabel("volume fraction"); ax.set_ylabel("|pred - true|")
-    ax.set_title("CH error vs volume fraction"); ax.legend()
+    ax.set_title("CH error vs volume fraction  (dashed = MAE)"); ax.legend()             # <<< CHANGED
     fig.tight_layout(); fig.savefig(os.path.join(out_dir, "ch_error_vs_vf.png"), dpi=150)
 
     print(f"\nsaved -> {out_dir}")

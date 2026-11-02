@@ -2,12 +2,14 @@
 Usage:
   python initial_Cnn.py --data-glob "test_dataset_200/**/result2D_*.nc"
   python initial_Cnn.py --tag scalar_test --notes "first run with scalar normalization"
+  python initial_Cnn.py --init-model runs/<old_run>/surrogate_model.pt --lr 1e-4 --tag finetune   # <<< ADDED (fine-tuning)
 
 Every run creates its own folder:
   runs/<date>_<time>_<normalizer>[_<tag>]/
       run.json            config, dataset, environment, training summary, test metrics
       predictions.csv     test-set true vs predicted values per sample
       surrogate_model.pt  best model weights + normalizer values
+      history.csv         train / val loss per epoch
       log.txt             everything printed to the console
 """
 
@@ -34,17 +36,19 @@ KAPPA_ATTR    = "kappa_thresh"   # achieved kappa attr; switch to "kappa_thresh"
 USE_SCALAR    = True          # False -> per-component Standardizer, True -> ScalarNormalizer
 KAPPA_SOLID   = 1.0           # solid-phase conductivity (--kappa-solid in simulate_conduction.py)
 
+FORCE_KXY_ZERO = False         # <<< ADDED  True -> model output for kxy is fixed at 0 and not learned
+
 DROP_NONCONVERGED = True
 
-DROP_ZERO_KAPPA = True        # <<< ADDED  drop samples whose thresholded kxx or kyy is ~0 (only applied when KAPPA_ATTR == "kappa_thresh")
-ZERO_TOL        = 1e-6        # <<< ADDED  |k| <= ZERO_TOL counts as zero; set just above your void-phase conductivity if it is nonzero
+DROP_ZERO_KAPPA = True        # drop samples whose thresholded kxx or kyy is ~0 (only applied when KAPPA_ATTR == "kappa_thresh")
+ZERO_TOL        = 1e-6        # |k| <= ZERO_TOL counts as zero; set just above the void phase conductivity if it is nonzero
 
-DEFAULT_GLOB  = "//wsl.localhost/Ubuntu/home/evin/muTopOpt/test_dataset_rw1000/**/result2D_*.nc"  
+DEFAULT_GLOB  = "//wsl.localhost/Ubuntu/home/evin/muTopOpt/test_dataset_sym_200/**/result2D_*.nc"
 
 VAL_FRAC      = 0.15
 TEST_FRAC     = 0.15
 BATCH_SIZE    = 64
-LR            = 3e-4
+LR            = 3e-4          # default LR; override with --lr (use smaller, e.g. 1e-4, when fine-tuning)
 MAX_EPOCHS    = 300
 PATIENCE      = 300
 SPLIT_SEED    = 0
@@ -70,9 +74,9 @@ class Tee:
 
 def make_run_dir(tag=None):
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    norm = "scalar" if USE_SCALAR else "standard"
-    name = f"{stamp}_{norm}" + (f"_{tag}" if tag else "")
-    path = os.path.join(RUNS_DIR, name)
+    # norm = "scalar" if USE_SCALAR else "standard"
+    name = f"{stamp}" + (f"_{tag}" if tag else "")  # add _{norm} if you want to include the normalizer in the folder name
+    path = os.path.join(RUNS_DIR, name) 
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -125,12 +129,12 @@ def _kappa3(flat):
     """flat [kxx,kxy,kyx,kyy] -> symmetric 3-vector [kxx, kxy, kyy]."""
     a = np.asarray(flat, dtype=np.float64).reshape(-1)
     kxx, kxy, kyx, kyy = a[0], a[1], a[2], a[3]
-    return np.array([kxx, 0.5 * (kxy + kyx), kyy], dtype=np.float32)   # off diagonal is symmetrized , is usually zero or near to zero 
+    return np.array([kxx, 0.5 * (kxy + kyx), kyy], dtype=np.float32)   # off diagonal is symmetrized , is usually zero or near to zero
 
 
-def _has_zero_diag(y):                                                  # <<< ADDED
-    """True if kxx or kyy of the symmetric 3-vector is ~0."""           # <<< ADDED
-    return abs(y[0]) <= ZERO_TOL or abs(y[2]) <= ZERO_TOL               # <<< ADDED
+def _has_zero_diag(y):
+    """True if kxx or kyy of the symmetric 3-vector is ~0."""
+    return abs(y[0]) <= ZERO_TOL or abs(y[2]) <= ZERO_TOL
 
 
 _TARGET_RE = re.compile(                              
@@ -162,9 +166,9 @@ def load_dataset(data_glob):
     if not files:
         raise SystemExit(f"No files matched: {data_glob}")
     xs, ys, ts = [], [], []
-    skipped_read = skipped_conv = 0                   
-    skipped_zero = 0                                                    # <<< ADDED
-    filter_zero = DROP_ZERO_KAPPA and KAPPA_ATTR == "kappa_thresh"      # <<< ADDED
+    skipped_read = skipped_conv = 0
+    skipped_zero = 0
+    filter_zero = DROP_ZERO_KAPPA and KAPPA_ATTR == "kappa_thresh"
 
     for f in files:
         try:
@@ -205,7 +209,7 @@ def load_dataset(data_glob):
         "n_samples_used": len(X),
         "n_dropped_nonconverged": skipped_conv,
         "n_dropped_unreadable": skipped_read,
-        "n_dropped_zero_kappa": skipped_zero,                           # <<< ADDED
+        "n_dropped_zero_kappa": skipped_zero,
         "density_shape": list(X.shape[1:]),
     }
     return X, Y, T, info
@@ -242,7 +246,7 @@ def split_indices(n):
 
 
 
-#  TARGET STANDARDIZATION (fit on train, invert at inference) 
+#  TARGET STANDARDIZATION (fit on train, invert at inference)
 
 class Standardizer:
     def __init__(self, y_train):
@@ -301,7 +305,13 @@ class MicrostructureCNN(nn.Module):
         )
     def forward(self, x):
         f = self.pool(self.features(x)).flatten(1)
-        return self.head(f)
+        out = self.head(f)                                          # <<< CHANGED
+        if FORCE_KXY_ZERO:                                          # <<< ADDED block
+            # kxy output replaced by a constant 0  no gradient flows from the kxy ( forced zero is done here , )
+            # loss term, so the network only learns kxx and kyy
+            zero = torch.zeros_like(out[:, 1:2])
+            out = torch.cat([out[:, 0:1], zero, out[:, 2:3]], dim=1)
+        return out
 
 
 # LOSS + TRAINING LOOP (Adam, early stopping on val)
@@ -314,31 +324,40 @@ def batches(X, Y, idx, bs, shuffle):
                torch.from_numpy(Y[sel]).to(DEVICE))
 
 
-def train(X, Y, tr, va, run_dir):
+def train(X, Y, tr, va, run_dir, init_model=None, lr=LR):           # <<< CHANGED (init_model, lr)
     model = MicrostructureCNN().to(DEVICE)
 
-    if USE_SCALAR:
+    if init_model:                                                  # <<< ADDED block (fine-tuning)
+        ckpt = torch.load(init_model, map_location=DEVICE)
+        model.load_state_dict(ckpt["state_dict"])
+        if ckpt["normalizer"] == "scalar":
+            std = ScalarNormalizer(Y[tr])  # scale = None is not given here , so the normalization done here is minmax normalization
+        else:
+            std = Standardizer(Y[tr])
+        std.mean, std.std = ckpt["y_mean"], ckpt["y_std"]           # reuse the ORIGINAL scaling, never refit
+        print(f"  fine-tuning from {init_model} (normalizer={ckpt['normalizer']}, lr={lr})")
+    elif USE_SCALAR:                                                # <<< CHANGED (was: if USE_SCALAR)
         std = ScalarNormalizer(Y[tr], scale=None)
     else:
         std = Standardizer(Y[tr])
     std.mean = std.mean.to(DEVICE); std.std = std.std.to(DEVICE)
 
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=MAX_EPOCHS)   # <<< ADDED ***************************
     loss_fn = nn.MSELoss()
 
-    history = {"epoch": [], "train_loss": [], "val_loss": []}      # <<< ADDED
+    history = {"epoch": [], "train_loss": [], "val_loss": []}
     best_val, best_state, best_epoch, bad = float("inf"), None, 0, 0
     epoch = 0
     for epoch in range(1, MAX_EPOCHS + 1):
-        model.train()                                                                          # this is the training part of the code
-        tloss, tnb = 0.0, 0 
-        for xb, yb in batches(X, Y, tr, BATCH_SIZE, shuffle=True):  # shuffle is set to false because we want to keep the order of the data consistent across epochs
+        model.train()                                               # training part
+        tloss, tnb = 0.0, 0
+        for xb, yb in batches(X, Y, tr, BATCH_SIZE, shuffle=True):  # <<< CHANGED comment: training batches are shuffled every epoch
             opt.zero_grad()
             loss = loss_fn(model(xb), std.encode(yb))
             # loss = loss_fn(std.decode(model(xb)), yb)   #***********************remove ***************************
             loss.backward(); opt.step()
-            tloss += loss.item(); tnb += 1                         # <<< ADDED
+            tloss += loss.item(); tnb += 1
         tloss /= max(tnb, 1)
         sched.step()  # <<< ADDED **********************
 
@@ -362,7 +381,7 @@ def train(X, Y, tr, va, run_dir):
         else:
             bad += 1
         if epoch % 10 == 0 or bad == 0:
-            print(f"  epoch {epoch:3d}  train_mse(scaled)={tloss:.4f}  "   # <<< CHANGED
+            print(f"  epoch {epoch:3d}  train_mse(scaled)={tloss:.4f}  "
                   f"val_mse(scaled)={vloss:.4f}  best={best_val:.4f}")
         if bad >= PATIENCE:
             print(f"  early stop at epoch {epoch}")
@@ -370,7 +389,7 @@ def train(X, Y, tr, va, run_dir):
 
     model.load_state_dict(best_state)
 
-    with open(os.path.join(run_dir, "history.csv"), "w", newline="") as f:   # <<< ADDED block
+    with open(os.path.join(run_dir, "history.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["epoch", "train_loss", "val_loss"])
         for e, tl, vl in zip(history["epoch"], history["train_loss"], history["val_loss"]):
@@ -381,7 +400,8 @@ def train(X, Y, tr, va, run_dir):
         "state_dict": model.state_dict(),
         "y_mean": std.mean.cpu(),
         "y_std":  std.std.cpu(),
-        "normalizer": "scalar" if USE_SCALAR else "standard",
+        "normalizer": "scalar" if isinstance(std, ScalarNormalizer) else "standard",   # <<< CHANGED (follows the normalizer actually used, also when fine-tuning)
+        "force_kxy_zero": FORCE_KXY_ZERO,                                              # <<< ADDED
     }, model_path)
     print(f"saved -> {model_path}")
 
@@ -404,6 +424,8 @@ def evaluate(model, std, X, Y, te, run_dir):
         for xb, _ in batches(X, Y, te, BATCH_SIZE, shuffle=False):
             preds.append(std.decode(model(xb)).cpu().numpy())
     pred = np.concatenate(preds)
+    if FORCE_KXY_ZERO:                                              # <<< ADDED: exact 0 in physical units for either normalizer
+        pred[:, 1] = 0.0
     true = Y[te]
 
     metrics = {}
@@ -415,7 +437,8 @@ def evaluate(model, std, X, Y, te, run_dir):
         rmse = np.sqrt(np.mean(err**2))
         r2   = 1 - np.sum(err**2) / (np.sum((t - t.mean())**2) + 1e-12)   # 1e-12 prevents division by zero
         metrics[n] = {"MAE": mae, "RMSE": rmse, "R2": r2}
-        print(f"  {n}: MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.3f}")
+        note = "   (fixed at 0, not learned; R2 not meaningful)" if (FORCE_KXY_ZERO and n == "kxy") else ""   # <<< ADDED
+        print(f"  {n}: MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.3f}{note}")                                # <<< CHANGED
 
     with open(os.path.join(run_dir, "predictions.csv"), "w", newline="") as f:
         w = csv.writer(f)
@@ -441,19 +464,22 @@ def data_quality_report(Y, T):
     return out
 
 
-def config_dict():
+def config_dict(args):                                              # <<< CHANGED (takes args)
     return {
         "DENSITY_VAR": DENSITY_VAR, "KAPPA_ATTR": KAPPA_ATTR,
         "normalizer": "ScalarNormalizer" if USE_SCALAR else "Standardizer",
         "KAPPA_SOLID": KAPPA_SOLID if USE_SCALAR else None,
+        "FORCE_KXY_ZERO": FORCE_KXY_ZERO,                           # <<< ADDED
         "DROP_NONCONVERGED": DROP_NONCONVERGED,
-        "DROP_ZERO_KAPPA": DROP_ZERO_KAPPA and KAPPA_ATTR == "kappa_thresh",   # <<< ADDED (records whether the filter was actually active)
-        "ZERO_TOL": ZERO_TOL,                                                  # <<< ADDED
+        "DROP_ZERO_KAPPA": DROP_ZERO_KAPPA and KAPPA_ATTR == "kappa_thresh",
+        "ZERO_TOL": ZERO_TOL,
         "VAL_FRAC": VAL_FRAC, "TEST_FRAC": TEST_FRAC,
-        "BATCH_SIZE": BATCH_SIZE, "LR": LR, "optimizer": "Adam", "loss": "MSELoss",
+        "BATCH_SIZE": BATCH_SIZE, "LR": args.lr, "optimizer": "Adam", "loss": "MSELoss",   # <<< CHANGED (records the LR actually used)
+        "scheduler": f"CosineAnnealingLR(T_max={MAX_EPOCHS})",     # <<< ADDED
         "MAX_EPOCHS": MAX_EPOCHS, "PATIENCE": PATIENCE,
         "SPLIT_SEED": SPLIT_SEED, "TRAIN_SEED": TRAIN_SEED,
-        "train_shuffle": False,
+        "train_shuffle": True,                                      # <<< CHANGED (was False; training batches are shuffled)
+        "init_model": args.init_model,                              # <<< ADDED (None = trained from scratch)
     }
 
 
@@ -485,10 +511,14 @@ def main():
     ap.add_argument("--data-glob", default=DEFAULT_GLOB)
     ap.add_argument("--tag", default=None, help="short label added to the run folder name")
     ap.add_argument("--notes", default="", help="free-text note stored in run.json")
+    ap.add_argument("--init-model", default=None,                   # <<< ADDED
+                    help="path to a surrogate_model.pt to continue training from (fine-tuning)")
+    ap.add_argument("--lr", type=float, default=LR,                 # <<< ADDED
+                    help="learning rate (use smaller, e.g. 1e-4, when fine-tuning)")
     args = ap.parse_args()
 
     run_dir = make_run_dir(args.tag)
-    sys.stdout = Tee(os.path.join(run_dir, "log.txt"))
+    sys.stdout = Tee(os.path.join(run_dir, "log.txt")) 
     started = datetime.now()
 
     torch.manual_seed(TRAIN_SEED); np.random.seed(TRAIN_SEED)
@@ -506,7 +536,8 @@ def main():
 
     print("\nTraining CNN...")
     train_start = time.perf_counter()
-    model, std, train_summary = train(X, Y, tr, va, run_dir)
+    model, std, train_summary = train(X, Y, tr, va, run_dir,
+                                      init_model=args.init_model, lr=args.lr)   # <<< CHANGED
     train_summary["train_time_s"] = time.perf_counter() - train_start
     _, _, metrics = evaluate(model, std, X, Y, te, run_dir)
     overall_time = time.perf_counter() - overall_start
@@ -526,7 +557,7 @@ def main():
         "started": started.isoformat(timespec="seconds"),
         "finished": datetime.now().isoformat(timespec="seconds"),
         "total_time_s": overall_time,
-        "config": config_dict(),
+        "config": config_dict(args),                                # <<< CHANGED
         "dataset": dataset_summary,
         "model": model_dict(model),
         "training": train_summary,
